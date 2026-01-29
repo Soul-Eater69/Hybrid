@@ -83,6 +83,8 @@ from src.services.cosmos_service import CosmosService
 from src.services.neo4j_service import Neo4jService
 from src.services.vector_service import VectorService
 from src.services.code_generator import CodeGenerator
+from src.services.guardrails import Guardrails, GuardrailConfig, GuardrailAction
+from src.services.context_aggregator import ContextAggregator
 
 
 # System prompt for the chat assistant
@@ -113,11 +115,17 @@ class ChatService(LoggerMixin):
 
     Orchestrates conversation flow with code context.
 
+    Includes:
+    - Guardrails for input/output validation
+    - Context aggregator for combining multiple sources
+
     Attributes:
         cosmos: Cosmos DB service for persistence
         neo4j: Neo4j service for graph queries
         vector: Vector service for semantic search
         generator: Code generator service
+        guardrails: Input/output validation
+        context_aggregator: Multi-source context combining
         llm: LangChain LLM for chat
     """
 
@@ -126,7 +134,9 @@ class ChatService(LoggerMixin):
         cosmos: CosmosService,
         neo4j: Neo4jService,
         vector: VectorService,
-        generator: CodeGenerator
+        generator: CodeGenerator,
+        guardrails: Guardrails | None = None,
+        context_aggregator: ContextAggregator | None = None
     ) -> None:
         """
         Initialize the chat service.
@@ -136,11 +146,30 @@ class ChatService(LoggerMixin):
             neo4j: Neo4j service
             vector: Vector service
             generator: Code generator service
+            guardrails: Optional guardrails instance
+            context_aggregator: Optional context aggregator
         """
         self.cosmos = cosmos
         self.neo4j = neo4j
         self.vector = vector
         self.generator = generator
+
+        # Initialize guardrails with chat-specific config
+        self.guardrails = guardrails or Guardrails(GuardrailConfig(
+            max_input_length=5000,
+            max_output_length=10000,
+            enable_injection_check=True,
+            enable_content_policy=True,
+            enable_pii_filter=True,
+            enable_code_safety=True
+        ))
+
+        # Initialize context aggregator
+        self.context_aggregator = context_aggregator or ContextAggregator(
+            vector_service=vector,
+            neo4j_service=neo4j,
+            token_budget=3000  # Smaller budget for chat
+        )
 
         # Initialize LLM for chat
         self._llm = ChatOpenAI(
@@ -217,6 +246,23 @@ class ChatService(LoggerMixin):
             content_preview=content[:100]
         )
 
+        # GUARDRAIL: Validate input message
+        input_validation = self.guardrails.validate_input(content)
+        if not input_validation.is_valid:
+            self.logger.warning(
+                "Chat input validation failed",
+                violations=input_validation.violations
+            )
+            return {
+                "message_id": str(uuid4()),
+                "content": f"I cannot process this request: {input_validation.message}",
+                "message_type": MessageType.TEXT,
+                "tokens_used": 0,
+                "code_references": [],
+                "created_at": datetime.utcnow().isoformat(),
+                "validation_error": True
+            }
+
         # Get or create conversation
         conversation = await self.cosmos.get_conversation(
             conversation_id,
@@ -243,13 +289,23 @@ class ChatService(LoggerMixin):
         # Add to conversation
         conversation.add_message(user_message)
 
-        # Gather code context
-        code_context = await self._gather_context(content, repo_id)
+        # CONTEXT AGGREGATOR: Gather context from all sources
+        # Convert conversation messages to dict format for aggregator
+        conversation_history = [
+            {"role": msg.role.value, "content": msg.content}
+            for msg in conversation.messages[:-1]  # Exclude current message
+        ]
 
-        # Build messages for LLM
-        llm_messages = self._build_llm_messages(
+        aggregated_context = await self.context_aggregator.aggregate_for_chat(
+            query=content,
+            repository_id=repo_id,
+            conversation_history=conversation_history
+        )
+
+        # Build messages for LLM using aggregated context
+        llm_messages = self._build_llm_messages_with_context(
             conversation,
-            code_context,
+            aggregated_context,
             repo_id
         )
 
@@ -259,6 +315,16 @@ class ChatService(LoggerMixin):
             response_content = response.content
             tokens_used = response.response_metadata.get("token_usage", {}).get("total_tokens", 0)
 
+            # GUARDRAIL: Validate output
+            output_validation = self.guardrails.validate_output(
+                response_content,
+                output_type="mixed"
+            )
+            if output_validation.modified_content:
+                response_content = output_validation.modified_content
+                self.logger.info("Output was modified by guardrails",
+                               violations=output_validation.violations)
+
         except Exception as e:
             self.logger.error("LLM generation failed", error=str(e))
             response_content = f"I encountered an error processing your request: {str(e)}"
@@ -267,13 +333,19 @@ class ChatService(LoggerMixin):
         # Determine message type based on content
         message_type = self._determine_message_type(response_content)
 
-        # Create assistant message
+        # Create assistant message with context from aggregator
+        entity_ids = [
+            item.metadata.get("entity_id", "")
+            for item in aggregated_context.similar_code
+            if item.metadata.get("entity_id")
+        ]
+
         assistant_message = Message(
             role=MessageRole.ASSISTANT,
             content=response_content,
             message_type=message_type,
             code_context=CodeContext(
-                entity_ids=[r["entity_id"] for r in code_context.get("similar_code", [])],
+                entity_ids=entity_ids,
                 search_query=content
             ),
             tokens_used=tokens_used
@@ -285,12 +357,24 @@ class ChatService(LoggerMixin):
         # Save conversation
         await self.cosmos.update_conversation(conversation)
 
+        # Format code references from aggregated context
+        code_references = [
+            {
+                "entity_id": item.metadata.get("entity_id", ""),
+                "name": item.metadata.get("name", ""),
+                "file_path": item.metadata.get("file_path", ""),
+                "score": item.score
+            }
+            for item in aggregated_context.similar_code[:3]
+        ]
+
         return {
             "message_id": str(assistant_message.id),
             "content": response_content,
             "message_type": message_type,
             "tokens_used": tokens_used,
-            "code_references": code_context.get("similar_code", [])[:3],
+            "code_references": code_references,
+            "context_metadata": aggregated_context.metadata,
             "created_at": assistant_message.created_at.isoformat()
         }
 
@@ -359,6 +443,55 @@ class ChatService(LoggerMixin):
                 context_str += f"\n- {meta.get('name', 'unknown')} in {meta.get('file_path', 'unknown')}\n"
 
         # System message
+        system_content = CHAT_SYSTEM_PROMPT.format(
+            repository_name=repository_id or "No repository selected",
+            code_context=context_str or "No specific code context available."
+        )
+        messages.append(SystemMessage(content=system_content))
+
+        # Add conversation history (limited to recent messages)
+        history = conversation.get_context_window(max_messages=10)
+        for msg in history[:-1]:  # Exclude the current message
+            if msg.role == MessageRole.USER:
+                messages.append(HumanMessage(content=msg.content))
+            elif msg.role == MessageRole.ASSISTANT:
+                messages.append(AIMessage(content=msg.content))
+
+        # Add current user message
+        if history:
+            current = history[-1]
+            if current.role == MessageRole.USER:
+                messages.append(HumanMessage(content=current.content))
+
+        return messages
+
+    def _build_llm_messages_with_context(
+        self,
+        conversation: Conversation,
+        aggregated_context: 'AggregatedContext',
+        repository_id: str | None
+    ) -> list:
+        """
+        Build message list for LLM using aggregated context.
+
+        This method uses the Context Aggregator's output to build
+        a well-structured prompt with context from multiple sources.
+
+        Args:
+            conversation: Conversation with history
+            aggregated_context: Context from ContextAggregator
+            repository_id: Repository ID
+
+        Returns:
+            List of LangChain messages
+        """
+        from src.services.context_aggregator import AggregatedContext
+        messages = []
+
+        # Use the formatted context from aggregator
+        context_str = aggregated_context.formatted_context
+
+        # System message with aggregated context
         system_content = CHAT_SYSTEM_PROMPT.format(
             repository_name=repository_id or "No repository selected",
             code_context=context_str or "No specific code context available."

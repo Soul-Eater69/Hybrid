@@ -85,10 +85,12 @@ from langchain.schema import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from src.core.config import settings
-from src.core.exceptions import LLMError
+from src.core.exceptions import LLMError, ValidationError
 from src.core.logging import LoggerMixin
 from src.services.neo4j_service import Neo4jService
 from src.services.vector_service import VectorService
+from src.services.guardrails import Guardrails, GuardrailConfig, GuardrailAction
+from src.services.context_aggregator import ContextAggregator
 
 
 # System prompt for code generation
@@ -170,16 +172,24 @@ class CodeGenerator(LoggerMixin):
     Uses LangChain with OpenAI to generate code based on
     context from the knowledge graph and vector database.
 
+    Includes:
+    - Guardrails for input/output validation
+    - Context aggregator for combining multiple context sources
+
     Attributes:
         neo4j: Neo4j service for graph queries
         vector: Vector service for similar code search
         llm: LangChain ChatOpenAI instance
+        guardrails: Input/output validation
+        context_aggregator: Multi-source context combining
     """
 
     def __init__(
         self,
         neo4j: Neo4jService,
-        vector: VectorService
+        vector: VectorService,
+        guardrails: Guardrails | None = None,
+        context_aggregator: ContextAggregator | None = None
     ) -> None:
         """
         Initialize the code generator.
@@ -187,9 +197,26 @@ class CodeGenerator(LoggerMixin):
         Args:
             neo4j: Neo4j service instance
             vector: Vector service instance
+            guardrails: Optional guardrails instance (creates default if not provided)
+            context_aggregator: Optional context aggregator (creates default if not provided)
         """
         self.neo4j = neo4j
         self.vector = vector
+
+        # Initialize guardrails with code-generation-specific config
+        self.guardrails = guardrails or Guardrails(GuardrailConfig(
+            max_input_length=10000,
+            enable_injection_check=True,
+            enable_code_safety=True,
+            enable_pii_filter=True
+        ))
+
+        # Initialize context aggregator
+        self.context_aggregator = context_aggregator or ContextAggregator(
+            vector_service=vector,
+            neo4j_service=neo4j,
+            token_budget=4000
+        )
 
         # Initialize LangChain LLM
         self._llm = ChatOpenAI(
@@ -241,21 +268,50 @@ class CodeGenerator(LoggerMixin):
             prompt=prompt[:100]
         )
 
+        # GUARDRAIL: Validate input prompt
+        input_validation = self.guardrails.validate_input(prompt)
+        if not input_validation.is_valid:
+            self.logger.warning(
+                "Input validation failed",
+                violations=input_validation.violations,
+                message=input_validation.message
+            )
+            raise ValidationError(
+                f"Input validation failed: {input_validation.message}",
+                details={"violations": input_validation.violations}
+            )
+
         try:
-            # Step 1: Retrieve similar code from Vector DB
-            similar_code = await self._retrieve_similar_code(
-                prompt,
-                repository_id,
-                similar_code_count
+            # Step 1: Use Context Aggregator to gather all context
+            aggregated_context = await self.context_aggregator.aggregate_for_generation(
+                prompt=prompt,
+                repository_id=repository_id,
+                context_entities=context_entities
             )
 
-            # Step 2: Get related entities from Knowledge Graph
-            related_entities = await self._get_related_entities(
-                repository_id,
-                context_entities
-            )
+            # Extract similar code and related entities from aggregated context
+            similar_code = [
+                {
+                    "entity_id": item.metadata.get("entity_id", ""),
+                    "metadata": item.metadata,
+                    "document": item.content,
+                    "score": item.score
+                }
+                for item in aggregated_context.similar_code
+            ]
 
-            # Step 3: Build the generation prompt
+            related_entities = [
+                {
+                    "id": item.metadata.get("entity_id", ""),
+                    "name": item.metadata.get("name", ""),
+                    "entity_type": item.metadata.get("entity_type", ""),
+                    "file_path": item.metadata.get("file_path", ""),
+                    "source_code": item.content
+                }
+                for item in aggregated_context.related_entities
+            ]
+
+            # Step 2: Build the generation prompt
             generation_prompt = self._build_prompt(
                 prompt=prompt,
                 similar_code=similar_code,
@@ -264,11 +320,22 @@ class CodeGenerator(LoggerMixin):
                 style_guide=style_guide
             )
 
-            # Step 4: Generate code with LLM
+            # Step 3: Generate code with LLM
             generated = await self._call_llm(generation_prompt)
 
-            # Step 5: Parse the response
+            # Step 4: Parse the response
             code, explanation = self._parse_response(generated)
+
+            # GUARDRAIL: Validate generated code
+            code_validation = self.guardrails.validate_generated_code(code)
+            if code_validation.violations:
+                self.logger.warning(
+                    "Generated code has safety warnings",
+                    violations=code_validation.violations,
+                    risk_level=code_validation.risk_level.value
+                )
+                # Add warnings to explanation
+                explanation += f"\n\n⚠️ **Security Review Required**: {', '.join(code_validation.violations)}"
 
             # Step 6: Generate tests if requested
             tests = None
