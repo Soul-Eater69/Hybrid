@@ -1,16 +1,20 @@
-# Code Intelligence Backend
+# Hybrid - Code Intelligence Platform
 
-A production-ready backend for intelligent code analysis and generation using **Vector DB**, **Neo4j Knowledge Graph**, **Cosmos DB**, **CodeQL**, and **LangChain**.
+A production-ready **full-stack** application for intelligent code analysis and generation using **Vector DB**, **Neo4j Knowledge Graph**, **Cosmos DB**, **CodeQL**, and **LangChain**.
+
+**Frontend**: React + TypeScript + TailwindCSS
+**Backend**: FastAPI + Python
 
 ## Table of Contents
 
 1. [Overview](#overview)
 2. [Architecture](#architecture)
 3. [Quick Start](#quick-start)
-4. [API Reference](#api-reference)
-5. [How It Works](#how-it-works)
-6. [Configuration](#configuration)
-7. [Development](#development)
+4. [Frontend](#frontend)
+5. [API Reference](#api-reference)
+6. [How It Works](#how-it-works)
+7. [Configuration](#configuration)
+8. [Development](#development)
 
 ---
 
@@ -152,6 +156,49 @@ uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers 4
 Once running, visit:
 - **Swagger UI**: http://localhost:8000/docs
 - **ReDoc**: http://localhost:8000/redoc
+
+---
+
+## Frontend
+
+The frontend is a React application located in the `frontend/` directory.
+
+### Frontend Quick Start
+
+```bash
+cd frontend
+
+# Install dependencies
+npm install
+
+# Start development server (with proxy to backend)
+npm run dev
+```
+
+Visit http://localhost:5173 to access the UI.
+
+### Frontend Features
+
+| Page | Description |
+|------|-------------|
+| **Dashboard** | Overview with stats, quick actions, and system health |
+| **Repositories** | Add, view, and manage analyzed repositories |
+| **Search** | Semantic code search with filters |
+| **Impact Analysis** | Visualize change impact across codebase |
+| **Code Generation** | AI-powered code generation with context |
+| **Chat** | Interactive AI conversations about code |
+
+### Frontend Tech Stack
+
+- **React 18** - UI framework
+- **TypeScript** - Type safety
+- **Vite** - Build tool
+- **TailwindCSS** - Styling
+- **React Query** - Server state management
+- **Zustand** - Client state management
+- **React Router** - Routing
+
+See [frontend/README.md](frontend/README.md) for detailed documentation.
 
 ---
 
@@ -468,8 +515,8 @@ User Prompt: "Create a function to validate phone numbers"
 ### Project Structure
 
 ```
-code-intel-backend/
-├── src/
+hybrid/
+├── src/                     # Backend source code
 │   ├── api/                 # FastAPI routes
 │   │   ├── endpoints/       # Individual endpoints
 │   │   ├── dependencies.py  # Dependency injection
@@ -482,6 +529,7 @@ code-intel-backend/
 │   │   ├── code_entity.py   # Code entity models
 │   │   ├── relationship.py  # Relationship models
 │   │   ├── repository.py    # Repository models
+│   │   ├── conversation.py  # Chat conversation models
 │   │   └── impact.py        # Impact analysis models
 │   ├── schemas/             # API schemas
 │   │   ├── requests.py      # Request schemas
@@ -490,11 +538,22 @@ code-intel-backend/
 │   │   ├── codeql_parser.py # Code parsing
 │   │   ├── neo4j_service.py # Graph operations
 │   │   ├── vector_service.py# Embedding operations
+│   │   ├── cosmos_service.py# Chat persistence
+│   │   ├── chat_service.py  # Chat orchestration
 │   │   ├── repository_service.py
 │   │   ├── search_service.py
 │   │   ├── impact_analyzer.py
 │   │   └── code_generator.py
 │   └── main.py              # Application entry
+├── frontend/                # React frontend
+│   ├── src/
+│   │   ├── components/      # Reusable components
+│   │   ├── pages/           # Page components
+│   │   ├── services/        # API client
+│   │   ├── store/           # State management
+│   │   └── styles/          # Global styles
+│   ├── package.json
+│   └── vite.config.ts
 ├── tests/                   # Test files
 ├── docs/                    # Documentation
 ├── requirements.txt
