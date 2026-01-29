@@ -51,6 +51,12 @@ structlog>=24.1.0         # Structured logging
 tenacity>=8.2.3           # Retry logic with exponential backoff
 
 # -----------------------------------------------------------------------------
+# LLM GUARDRAILS & SAFETY
+# -----------------------------------------------------------------------------
+guardrails-ai>=0.4.0      # LLM output validation and guardrails
+
+
+# -----------------------------------------------------------------------------
 # DEVELOPMENT DEPENDENCIES
 # -----------------------------------------------------------------------------
 pytest>=7.4.4             # Testing framework

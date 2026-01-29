@@ -1,83 +1,58 @@
 """
-Guardrails Module
-=================
+Guardrails Module (using Guardrails AI)
+=======================================
 
-Provides safety mechanisms for LLM interactions:
-- Input validation (prompt injection protection, length limits)
-- Output validation (code safety checks, format validation)
-- Content filtering (harmful content detection)
-- Rate limiting logic
+Production-grade LLM safety using the Guardrails AI library.
 
-WHY GUARDRAILS?
-    LLMs can be manipulated or produce harmful outputs.
-    Guardrails act as a safety layer:
+Provides:
+- Input validation (prompt injection, content policy)
+- Output validation (code safety, PII filtering, format)
+- Configurable validators from Guardrails Hub
 
-    User Input → [GUARDRAILS] → LLM → [GUARDRAILS] → Output
-                     ↓                      ↓
-              Validate/Sanitize       Validate/Filter
+GUARDRAILS AI OVERVIEW:
+    Guardrails AI is a production library for validating LLM outputs.
+    It uses "validators" from the Guardrails Hub that can be composed.
 
-COMPONENTS:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                   GUARDRAILS AI FLOW                             │
+    │                                                                  │
+    │  User Input                                                      │
+    │      ↓                                                           │
+    │  ┌─────────────────┐                                            │
+    │  │ Guard().use()   │  ← Compose validators                      │
+    │  │ - DetectPII     │                                            │
+    │  │ - ToxicLanguage │                                            │
+    │  │ - ValidPython   │                                            │
+    │  └────────┬────────┘                                            │
+    │           ↓                                                      │
+    │  ┌─────────────────┐                                            │
+    │  │   Validation    │  ← On fail: fix, reask, exception          │
+    │  └────────┬────────┘                                            │
+    │           ↓                                                      │
+    │      Validated Output                                           │
+    └─────────────────────────────────────────────────────────────────┘
 
-1. INPUT GUARDRAILS:
-   - Prompt injection detection
-   - Input length limits
-   - Content policy checks
-   - PII detection
+VALIDATORS USED:
+    From Guardrails Hub (https://hub.guardrailsai.com/):
+    - DetectPII: Detects and redacts personal information
+    - ToxicLanguage: Detects harmful/toxic content
+    - DetectPromptInjection: Detects prompt injection attempts
+    - ValidPython: Validates Python code syntax
+    - RestrictToTopic: Keeps responses on topic
 
-2. OUTPUT GUARDRAILS:
-   - Code safety validation
-   - Format verification
-   - Sensitive data filtering
-   - Response quality checks
-
-DATA FLOW:
-    ┌─────────────────────────────────────────────────────────────┐
-    │                   INPUT GUARDRAILS                           │
-    │                                                              │
-    │  User Input                                                  │
-    │      ↓                                                       │
-    │  ┌─────────────────┐                                        │
-    │  │ Length Check    │ ─ Too long? → Truncate/Reject          │
-    │  └────────┬────────┘                                        │
-    │           ↓                                                  │
-    │  ┌─────────────────┐                                        │
-    │  │ Injection Check │ ─ Suspicious? → Flag/Reject            │
-    │  └────────┬────────┘                                        │
-    │           ↓                                                  │
-    │  ┌─────────────────┐                                        │
-    │  │ Content Policy  │ ─ Harmful? → Reject with message       │
-    │  └────────┬────────┘                                        │
-    │           ↓                                                  │
-    │      Validated Input → LLM                                  │
-    └─────────────────────────────────────────────────────────────┘
-
-    ┌─────────────────────────────────────────────────────────────┐
-    │                  OUTPUT GUARDRAILS                           │
-    │                                                              │
-    │  LLM Response                                                │
-    │      ↓                                                       │
-    │  ┌─────────────────┐                                        │
-    │  │ Code Safety     │ ─ Dangerous code? → Remove/Warn        │
-    │  └────────┬────────┘                                        │
-    │           ↓                                                  │
-    │  ┌─────────────────┐                                        │
-    │  │ Format Check    │ ─ Malformed? → Attempt fix             │
-    │  └────────┬────────┘                                        │
-    │           ↓                                                  │
-    │  ┌─────────────────┐                                        │
-    │  │ PII Filter      │ ─ Contains PII? → Redact               │
-    │  └────────┬────────┘                                        │
-    │           ↓                                                  │
-    │      Safe Output → User                                     │
-    └─────────────────────────────────────────────────────────────┘
+INSTALLATION:
+    pip install guardrails-ai
+    guardrails hub install hub://guardrails/detect_pii
+    guardrails hub install hub://guardrails/toxic_language
+    guardrails hub install hub://guardrails/detect_prompt_injection
+    guardrails hub install hub://guardrails/valid_python
 
 USAGE:
     from src.services.guardrails import Guardrails, GuardrailConfig
 
     guardrails = Guardrails(GuardrailConfig(
-        max_input_length=10000,
-        enable_injection_check=True,
-        enable_code_safety=True
+        enable_pii_filter=True,
+        enable_toxicity_check=True
     ))
 
     # Validate input
@@ -86,15 +61,51 @@ USAGE:
         return error_response(result.message)
 
     # Validate output
-    safe_output = guardrails.validate_output(llm_response)
+    result = guardrails.validate_output(llm_response)
+    safe_output = result.modified_content or llm_response
 """
 
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 from src.core.logging import LoggerMixin
+
+# Try to import guardrails-ai components
+# Fall back to manual validation if not installed
+try:
+    from guardrails import Guard
+    from guardrails.errors import ValidationError as GuardrailsValidationError
+    GUARDRAILS_AVAILABLE = True
+except ImportError:
+    GUARDRAILS_AVAILABLE = False
+
+# Try to import hub validators
+# These need to be installed separately via: guardrails hub install hub://guardrails/<validator>
+try:
+    from guardrails.hub import DetectPII
+    DETECT_PII_AVAILABLE = True
+except ImportError:
+    DETECT_PII_AVAILABLE = False
+
+try:
+    from guardrails.hub import ToxicLanguage
+    TOXIC_LANGUAGE_AVAILABLE = True
+except ImportError:
+    TOXIC_LANGUAGE_AVAILABLE = False
+
+try:
+    from guardrails.hub import DetectPromptInjection
+    PROMPT_INJECTION_AVAILABLE = True
+except ImportError:
+    PROMPT_INJECTION_AVAILABLE = False
+
+try:
+    from guardrails.hub import ValidPython
+    VALID_PYTHON_AVAILABLE = True
+except ImportError:
+    VALID_PYTHON_AVAILABLE = False
 
 
 class GuardrailAction(Enum):
@@ -144,144 +155,76 @@ class GuardrailConfig:
     Attributes:
         max_input_length: Maximum allowed input length
         max_output_length: Maximum allowed output length
-        enable_injection_check: Check for prompt injection
-        enable_content_policy: Check content policy
-        enable_pii_filter: Filter PII from outputs
-        enable_code_safety: Check code for dangerous patterns
-        blocked_patterns: Additional regex patterns to block
-        allowed_code_imports: Whitelist of allowed imports in generated code
+        enable_pii_filter: Filter PII from outputs (uses DetectPII)
+        enable_toxicity_check: Check for toxic content (uses ToxicLanguage)
+        enable_injection_check: Check for prompt injection (uses DetectPromptInjection)
+        enable_code_validation: Validate Python code syntax (uses ValidPython)
+        enable_content_policy: Check content policy (manual check)
+        pii_on_fail: Action when PII detected ("fix", "exception", "noop")
+        toxicity_threshold: Threshold for toxic content detection (0-1)
+        custom_validators: List of additional custom validator functions
     """
     # Length limits
     max_input_length: int = 50000
     max_output_length: int = 100000
 
-    # Feature flags
-    enable_injection_check: bool = True
-    enable_content_policy: bool = True
+    # Feature flags for Guardrails AI validators
     enable_pii_filter: bool = True
-    enable_code_safety: bool = True
+    enable_toxicity_check: bool = True
+    enable_injection_check: bool = True
+    enable_code_validation: bool = True
+    enable_content_policy: bool = True
 
-    # Custom patterns
-    blocked_patterns: list[str] = field(default_factory=list)
-    allowed_code_imports: list[str] = field(default_factory=lambda: [
-        "os", "sys", "re", "json", "typing", "datetime", "collections",
-        "itertools", "functools", "pathlib", "dataclasses", "enum",
-        "logging", "unittest", "pytest", "asyncio", "aiohttp",
-        "requests", "fastapi", "pydantic", "sqlalchemy", "numpy", "pandas"
-    ])
+    # Guardrails AI specific settings
+    pii_on_fail: str = "fix"  # "fix" = redact, "exception" = raise, "noop" = pass
+    toxicity_threshold: float = 0.8
+    toxicity_on_fail: str = "exception"
 
-    # Thresholds
-    injection_score_threshold: float = 0.7
-    pii_confidence_threshold: float = 0.8
+    # Custom validators (fallback or additional)
+    custom_validators: list[Callable] = field(default_factory=list)
 
 
 # ============================================================================
-# PROMPT INJECTION DETECTION PATTERNS
+# FALLBACK PATTERNS (used when Guardrails AI not installed)
 # ============================================================================
 
 INJECTION_PATTERNS = [
-    # Direct instruction overrides
     r"ignore\s+(previous|all|above)\s+(instructions?|prompts?)",
     r"disregard\s+(previous|all|your)\s+(instructions?|rules?)",
     r"forget\s+(everything|all|previous)",
     r"new\s+instructions?:",
-    r"override\s+(system|instructions?)",
-
-    # Role manipulation
     r"you\s+are\s+(now|actually)\s+",
     r"pretend\s+(to\s+be|you('re|'re)|you\s+are)",
-    r"act\s+as\s+(if|a)",
-    r"simulate\s+(being|a)",
-    r"roleplay\s+as",
-
-    # System prompt extraction
-    r"(what|show|tell|reveal|display|print)\s+(is|me|are)?\s*(your|the)?\s*(system\s+)?(prompt|instructions)",
-    r"repeat\s+(your|the|back)\s+(system\s+)?(prompt|instructions)",
-
-    # Delimiter exploitation
-    r"\[SYSTEM\]|\[INST\]|\<\|im_start\|",
-    r"###\s*(SYSTEM|USER|ASSISTANT)",
-    r"\{\{(system|user|assistant)\}\}",
-
-    # Encoding tricks
-    r"base64\s*(decode|encode)",
-    r"unicode\s*(escape|decode)",
-    r"hex\s*(decode|encode)",
+    r"(what|show|tell|reveal)\s+(is|me)?\s*(your|the)?\s*(system\s+)?(prompt|instructions)",
 ]
 
-# Compiled patterns for efficiency
-COMPILED_INJECTION_PATTERNS = [
-    re.compile(pattern, re.IGNORECASE) for pattern in INJECTION_PATTERNS
+PII_PATTERNS = [
+    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "email", "[EMAIL REDACTED]"),
+    (r"\b(\+?1[-.\s]?)?(\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b", "phone", "[PHONE REDACTED]"),
+    (r"\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b", "ssn", "[SSN REDACTED]"),
+    (r"\b(sk-[a-zA-Z0-9]{32,})\b", "api_key", "[API_KEY REDACTED]"),
 ]
-
-
-# ============================================================================
-# DANGEROUS CODE PATTERNS
-# ============================================================================
 
 DANGEROUS_CODE_PATTERNS = [
-    # System command execution
     (r"os\.system\s*\(", "System command execution"),
-    (r"subprocess\.(run|call|Popen|check_output)\s*\(", "Subprocess execution"),
+    (r"subprocess\.(run|call|Popen)\s*\(", "Subprocess execution"),
     (r"exec\s*\(", "Dynamic code execution"),
     (r"eval\s*\(", "Dynamic evaluation"),
     (r"__import__\s*\(", "Dynamic import"),
-    (r"compile\s*\(.*,\s*['\"]exec['\"]\s*\)", "Dynamic compilation"),
-
-    # File system operations (without context)
-    (r"open\s*\([^)]*['\"]w['\"]", "File write operation"),
-    (r"shutil\.(rmtree|remove|move)", "File system modification"),
-    (r"os\.(remove|unlink|rmdir)", "File deletion"),
-
-    # Network operations
-    (r"socket\.socket\s*\(", "Raw socket creation"),
-    (r"urllib\.request\.urlopen\s*\(", "URL fetching"),
-
-    # Credential/secret patterns
-    (r"(password|secret|api_key|token)\s*=\s*['\"][^'\"]+['\"]", "Hardcoded credential"),
-
-    # Pickle (security risk)
-    (r"pickle\.(load|loads)\s*\(", "Pickle deserialization (security risk)"),
-]
-
-
-# ============================================================================
-# PII PATTERNS
-# ============================================================================
-
-PII_PATTERNS = [
-    # Email addresses
-    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "email"),
-
-    # Phone numbers (various formats)
-    (r"\b(\+?1[-.\s]?)?(\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b", "phone"),
-
-    # SSN
-    (r"\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b", "ssn"),
-
-    # Credit card numbers
-    (r"\b(?:\d{4}[-\s]?){3}\d{4}\b", "credit_card"),
-
-    # IP addresses
-    (r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", "ip_address"),
-
-    # API keys (common patterns)
-    (r"\b(sk-[a-zA-Z0-9]{32,})\b", "api_key"),
-    (r"\b(ghp_[a-zA-Z0-9]{36})\b", "github_token"),
-    (r"\b(xox[baprs]-[0-9a-zA-Z-]+)\b", "slack_token"),
 ]
 
 
 class Guardrails(LoggerMixin):
     """
-    Main guardrails class providing input/output validation.
+    Production-grade guardrails using Guardrails AI library.
 
-    This class acts as a safety layer between users and the LLM,
-    validating inputs before they reach the model and outputs
-    before they reach the user.
+    Falls back to manual validation if library not installed.
 
     Attributes:
         config: Guardrail configuration
+        input_guard: Guard for input validation
+        output_guard: Guard for output validation
+        code_guard: Guard for code validation
     """
 
     def __init__(self, config: GuardrailConfig | None = None) -> None:
@@ -293,11 +236,89 @@ class Guardrails(LoggerMixin):
         """
         self.config = config or GuardrailConfig()
 
-        # Compile custom blocked patterns
-        self._custom_patterns = [
-            re.compile(pattern, re.IGNORECASE)
-            for pattern in self.config.blocked_patterns
-        ]
+        # Track which validators are available
+        self._validators_status = {
+            "guardrails_ai": GUARDRAILS_AVAILABLE,
+            "detect_pii": DETECT_PII_AVAILABLE,
+            "toxic_language": TOXIC_LANGUAGE_AVAILABLE,
+            "prompt_injection": PROMPT_INJECTION_AVAILABLE,
+            "valid_python": VALID_PYTHON_AVAILABLE,
+        }
+
+        self.logger.info(
+            "Initializing Guardrails",
+            guardrails_ai_available=GUARDRAILS_AVAILABLE,
+            validators=self._validators_status
+        )
+
+        # Initialize guards if Guardrails AI is available
+        self.input_guard = None
+        self.output_guard = None
+        self.code_guard = None
+
+        if GUARDRAILS_AVAILABLE:
+            self._setup_guards()
+
+    def _setup_guards(self) -> None:
+        """
+        Set up Guardrails AI guards with validators from hub.
+        """
+        # Input guard - for validating user inputs
+        input_validators = []
+
+        if self.config.enable_injection_check and PROMPT_INJECTION_AVAILABLE:
+            input_validators.append(
+                DetectPromptInjection(on_fail="exception")
+            )
+
+        if self.config.enable_toxicity_check and TOXIC_LANGUAGE_AVAILABLE:
+            input_validators.append(
+                ToxicLanguage(
+                    threshold=self.config.toxicity_threshold,
+                    on_fail=self.config.toxicity_on_fail
+                )
+            )
+
+        if input_validators:
+            self.input_guard = Guard().use_many(*input_validators)
+            self.logger.info(f"Input guard configured with {len(input_validators)} validators")
+
+        # Output guard - for validating LLM outputs
+        output_validators = []
+
+        if self.config.enable_pii_filter and DETECT_PII_AVAILABLE:
+            output_validators.append(
+                DetectPII(on_fail=self.config.pii_on_fail)
+            )
+
+        if self.config.enable_toxicity_check and TOXIC_LANGUAGE_AVAILABLE:
+            output_validators.append(
+                ToxicLanguage(
+                    threshold=self.config.toxicity_threshold,
+                    on_fail="fix"  # Fix toxic content in output rather than reject
+                )
+            )
+
+        if output_validators:
+            self.output_guard = Guard().use_many(*output_validators)
+            self.logger.info(f"Output guard configured with {len(output_validators)} validators")
+
+        # Code guard - for validating generated code
+        code_validators = []
+
+        if self.config.enable_code_validation and VALID_PYTHON_AVAILABLE:
+            code_validators.append(
+                ValidPython(on_fail="noop")  # Don't fail, just flag
+            )
+
+        if self.config.enable_pii_filter and DETECT_PII_AVAILABLE:
+            code_validators.append(
+                DetectPII(on_fail="fix")
+            )
+
+        if code_validators:
+            self.code_guard = Guard().use_many(*code_validators)
+            self.logger.info(f"Code guard configured with {len(code_validators)} validators")
 
     # =========================================================================
     # INPUT VALIDATION
@@ -307,10 +328,7 @@ class Guardrails(LoggerMixin):
         """
         Validate user input before sending to LLM.
 
-        Performs multiple checks:
-        1. Length validation
-        2. Prompt injection detection
-        3. Content policy check
+        Uses Guardrails AI if available, falls back to manual validation.
 
         Args:
             text: User input text
@@ -318,23 +336,12 @@ class Guardrails(LoggerMixin):
 
         Returns:
             GuardrailResult with validation outcome
-
-        Example:
-            result = guardrails.validate_input(user_prompt)
-            if not result.is_valid:
-                raise ValueError(result.message)
         """
         violations = []
-        risk_level = RiskLevel.LOW
-        metadata = {"original_length": len(text)}
+        metadata = {"original_length": len(text), "using_guardrails_ai": GUARDRAILS_AVAILABLE}
 
-        # Check 1: Length validation
+        # Check 1: Length validation (always manual)
         if len(text) > self.config.max_input_length:
-            self.logger.warning(
-                "Input exceeds max length",
-                length=len(text),
-                max_length=self.config.max_input_length
-            )
             return GuardrailResult(
                 is_valid=False,
                 action=GuardrailAction.REJECT,
@@ -344,121 +351,93 @@ class Guardrails(LoggerMixin):
                 metadata=metadata
             )
 
-        # Check 2: Prompt injection detection
-        if self.config.enable_injection_check:
-            injection_result = self._check_prompt_injection(text)
-            if injection_result["detected"]:
-                violations.extend(injection_result["patterns"])
-                risk_level = RiskLevel.HIGH if injection_result["score"] > 0.5 else RiskLevel.MEDIUM
+        # Check 2: Use Guardrails AI if available
+        if self.input_guard is not None:
+            try:
+                # Validate using Guardrails AI
+                result = self.input_guard.validate(text)
 
-                if injection_result["score"] >= self.config.injection_score_threshold:
-                    self.logger.warning(
-                        "Prompt injection detected",
-                        score=injection_result["score"],
-                        patterns=injection_result["patterns"]
+                if result.validation_passed:
+                    return GuardrailResult(
+                        is_valid=True,
+                        action=GuardrailAction.ALLOW,
+                        risk_level=RiskLevel.LOW,
+                        message="Input validated successfully via Guardrails AI",
+                        metadata=metadata
                     )
+                else:
+                    # Extract failure info
+                    for fail in result.validation_summaries:
+                        violations.append(f"{fail.validator_name}: {fail.failure_reason}")
+
                     return GuardrailResult(
                         is_valid=False,
                         action=GuardrailAction.REJECT,
-                        risk_level=RiskLevel.CRITICAL,
-                        message="Your request appears to contain instructions that could manipulate the AI. Please rephrase your question.",
+                        risk_level=RiskLevel.HIGH,
+                        message="Input failed validation",
                         violations=violations,
-                        metadata={**metadata, "injection_score": injection_result["score"]}
+                        metadata=metadata
                     )
 
-        # Check 3: Content policy
-        if self.config.enable_content_policy:
-            policy_result = self._check_content_policy(text)
-            if not policy_result["compliant"]:
-                violations.extend(policy_result["violations"])
+            except GuardrailsValidationError as e:
+                self.logger.warning(f"Guardrails validation exception: {e}")
                 return GuardrailResult(
                     is_valid=False,
                     action=GuardrailAction.REJECT,
-                    risk_level=RiskLevel.HIGH,
-                    message=policy_result["message"],
-                    violations=violations,
+                    risk_level=RiskLevel.CRITICAL,
+                    message=str(e),
+                    violations=["guardrails_exception"],
                     metadata=metadata
                 )
 
-        # Check 4: Custom blocked patterns
-        for pattern in self._custom_patterns:
-            if pattern.search(text):
-                violations.append(f"blocked_pattern:{pattern.pattern}")
+            except Exception as e:
+                self.logger.error(f"Unexpected guardrails error: {e}")
+                # Fall through to manual validation
 
-        # Input passed all checks
-        return GuardrailResult(
-            is_valid=True,
-            action=GuardrailAction.ALLOW if not violations else GuardrailAction.WARN,
-            risk_level=risk_level,
-            message="Input validated successfully",
-            violations=violations,
-            metadata=metadata
-        )
+        # Fallback: Manual validation
+        return self._manual_validate_input(text, metadata)
 
-    def _check_prompt_injection(self, text: str) -> dict[str, Any]:
+    def _manual_validate_input(self, text: str, metadata: dict) -> GuardrailResult:
         """
-        Check for prompt injection attempts.
-
-        Args:
-            text: Input text to check
-
-        Returns:
-            Dict with detection results
-        """
-        detected_patterns = []
-        score = 0.0
-
-        text_lower = text.lower()
-
-        for pattern in COMPILED_INJECTION_PATTERNS:
-            matches = pattern.findall(text_lower)
-            if matches:
-                detected_patterns.append(pattern.pattern)
-                score += 0.2  # Each pattern match increases score
-
-        # Check for excessive special characters (delimiter abuse)
-        special_char_ratio = sum(1 for c in text if c in "[]{}|<>") / max(len(text), 1)
-        if special_char_ratio > 0.1:
-            detected_patterns.append("excessive_special_chars")
-            score += 0.1
-
-        # Normalize score to 0-1
-        score = min(score, 1.0)
-
-        return {
-            "detected": len(detected_patterns) > 0,
-            "score": score,
-            "patterns": detected_patterns
-        }
-
-    def _check_content_policy(self, text: str) -> dict[str, Any]:
-        """
-        Check content against policy.
-
-        Args:
-            text: Input text
-
-        Returns:
-            Policy compliance result
+        Manual input validation (fallback when Guardrails AI not available).
         """
         violations = []
+        metadata["validation_method"] = "manual"
 
-        # Check for harmful content requests
-        harmful_patterns = [
-            (r"(create|write|generate)\s+(malware|virus|exploit)", "malware_request"),
-            (r"(hack|attack|ddos|dos)\s+(into|against)", "attack_request"),
-            (r"(steal|extract|exfiltrate)\s+(data|credentials|passwords)", "data_theft"),
-        ]
+        # Check for prompt injection
+        if self.config.enable_injection_check:
+            text_lower = text.lower()
+            for pattern in INJECTION_PATTERNS:
+                if re.search(pattern, text_lower, re.IGNORECASE):
+                    violations.append(f"injection_pattern:{pattern[:30]}")
 
-        for pattern, violation_type in harmful_patterns:
-            if re.search(pattern, text, re.IGNORECASE):
-                violations.append(violation_type)
+        # Check content policy
+        if self.config.enable_content_policy:
+            harmful_patterns = [
+                (r"(create|write|generate)\s+(malware|virus|exploit)", "malware_request"),
+                (r"(hack|attack|ddos)\s+(into|against)", "attack_request"),
+            ]
+            for pattern, violation_type in harmful_patterns:
+                if re.search(pattern, text, re.IGNORECASE):
+                    violations.append(violation_type)
 
-        return {
-            "compliant": len(violations) == 0,
-            "violations": violations,
-            "message": "Your request contains content that violates our usage policy." if violations else ""
-        }
+        if violations:
+            return GuardrailResult(
+                is_valid=False,
+                action=GuardrailAction.REJECT,
+                risk_level=RiskLevel.HIGH,
+                message="Input contains potentially harmful content",
+                violations=violations,
+                metadata=metadata
+            )
+
+        return GuardrailResult(
+            is_valid=True,
+            action=GuardrailAction.ALLOW,
+            risk_level=RiskLevel.LOW,
+            message="Input validated successfully (manual check)",
+            metadata=metadata
+        )
 
     # =========================================================================
     # OUTPUT VALIDATION
@@ -473,10 +452,7 @@ class Guardrails(LoggerMixin):
         """
         Validate LLM output before returning to user.
 
-        Performs multiple checks:
-        1. Length validation
-        2. Code safety check (if output contains code)
-        3. PII filtering
+        Uses Guardrails AI if available, falls back to manual validation.
 
         Args:
             text: LLM output text
@@ -485,37 +461,41 @@ class Guardrails(LoggerMixin):
 
         Returns:
             GuardrailResult (may include modified content)
-
-        Example:
-            result = guardrails.validate_output(llm_response, output_type="code")
-            output = result.modified_content or llm_response
         """
         violations = []
         modified_text = text
-        risk_level = RiskLevel.LOW
-        metadata = {"output_type": output_type}
+        metadata = {"output_type": output_type, "using_guardrails_ai": GUARDRAILS_AVAILABLE}
 
         # Check 1: Length
         if len(text) > self.config.max_output_length:
-            modified_text = text[:self.config.max_output_length] + "\n\n[Output truncated due to length]"
+            modified_text = text[:self.config.max_output_length] + "\n\n[Output truncated]"
             violations.append("length_truncated")
 
-        # Check 2: Code safety (if enabled and output contains code)
-        if self.config.enable_code_safety and ("```" in text or output_type == "code"):
-            code_result = self._check_code_safety(text)
-            if code_result["issues"]:
-                violations.extend(code_result["issues"])
-                risk_level = RiskLevel.MEDIUM
-                modified_text = self._add_code_warnings(modified_text, code_result["issues"])
-                metadata["code_warnings"] = code_result["issues"]
+        # Check 2: Use Guardrails AI if available
+        if self.output_guard is not None:
+            try:
+                result = self.output_guard.validate(modified_text)
 
-        # Check 3: PII filtering
-        if self.config.enable_pii_filter:
-            pii_result = self._filter_pii(modified_text)
-            if pii_result["found"]:
-                violations.extend([f"pii:{t}" for t in pii_result["types"]])
-                modified_text = pii_result["filtered_text"]
-                metadata["pii_redacted"] = pii_result["count"]
+                if result.validation_passed:
+                    # Check if content was modified (e.g., PII redacted)
+                    if result.validated_output != modified_text:
+                        modified_text = result.validated_output
+                        violations.append("content_modified_by_guardrails")
+                else:
+                    for fail in result.validation_summaries:
+                        violations.append(f"{fail.validator_name}: {fail.failure_reason}")
+
+                metadata["guardrails_passed"] = result.validation_passed
+
+            except Exception as e:
+                self.logger.warning(f"Output validation error: {e}")
+                # Fall through to manual validation
+
+        # Fallback: Manual PII filtering
+        if self.config.enable_pii_filter and not DETECT_PII_AVAILABLE:
+            modified_text, pii_found = self._manual_filter_pii(modified_text)
+            if pii_found:
+                violations.extend(pii_found)
 
         action = GuardrailAction.ALLOW
         if modified_text != text:
@@ -524,96 +504,38 @@ class Guardrails(LoggerMixin):
             action = GuardrailAction.WARN
 
         return GuardrailResult(
-            is_valid=True,  # We allow outputs but may modify them
+            is_valid=True,
             action=action,
-            risk_level=risk_level,
+            risk_level=RiskLevel.LOW if not violations else RiskLevel.MEDIUM,
             message="Output processed successfully",
             modified_content=modified_text if modified_text != text else None,
             violations=violations,
             metadata=metadata
         )
 
-    def _check_code_safety(self, text: str) -> dict[str, Any]:
+    def _manual_filter_pii(self, text: str) -> tuple[str, list[str]]:
         """
-        Check code in output for dangerous patterns.
-
-        Args:
-            text: Text potentially containing code
-
-        Returns:
-            Code safety analysis result
+        Manual PII filtering (fallback).
         """
-        issues = []
+        filtered = text
+        found = []
 
-        # Extract code blocks
-        code_blocks = re.findall(r"```(?:\w*\n)?(.*?)```", text, re.DOTALL)
-        code_to_check = "\n".join(code_blocks) if code_blocks else text
+        for pattern, pii_type, replacement in PII_PATTERNS:
+            if re.search(pattern, filtered):
+                filtered = re.sub(pattern, replacement, filtered)
+                found.append(f"pii:{pii_type}")
 
-        for pattern, description in DANGEROUS_CODE_PATTERNS:
-            if re.search(pattern, code_to_check, re.IGNORECASE):
-                issues.append(description)
-
-        return {
-            "issues": issues,
-            "code_blocks_found": len(code_blocks)
-        }
-
-    def _add_code_warnings(self, text: str, issues: list[str]) -> str:
-        """
-        Add warnings to code output.
-
-        Args:
-            text: Output text
-            issues: List of issues found
-
-        Returns:
-            Text with warnings added
-        """
-        warning = "\n\n⚠️ **Security Notice**: The generated code contains patterns that may require careful review:\n"
-        for issue in issues:
-            warning += f"- {issue}\n"
-        warning += "\nPlease review the code carefully before using it in production.\n"
-
-        return warning + text
-
-    def _filter_pii(self, text: str) -> dict[str, Any]:
-        """
-        Filter PII from output.
-
-        Args:
-            text: Output text
-
-        Returns:
-            Filtering result with redacted text
-        """
-        filtered_text = text
-        found_types = []
-        count = 0
-
-        for pattern, pii_type in PII_PATTERNS:
-            matches = re.findall(pattern, filtered_text)
-            if matches:
-                found_types.append(pii_type)
-                count += len(matches)
-                # Redact the PII
-                filtered_text = re.sub(pattern, f"[REDACTED-{pii_type.upper()}]", filtered_text)
-
-        return {
-            "found": count > 0,
-            "types": list(set(found_types)),
-            "count": count,
-            "filtered_text": filtered_text
-        }
+        return filtered, found
 
     # =========================================================================
-    # CODE GENERATION SPECIFIC
+    # CODE VALIDATION
     # =========================================================================
 
     def validate_generated_code(self, code: str, language: str = "python") -> GuardrailResult:
         """
-        Validate generated code specifically.
+        Validate generated code.
 
-        More thorough checks for code generation outputs.
+        Uses Guardrails AI ValidPython if available, plus manual safety checks.
 
         Args:
             code: Generated code
@@ -623,16 +545,29 @@ class Guardrails(LoggerMixin):
             Validation result
         """
         violations = []
-        modified_code = code
+        metadata = {"language": language, "using_guardrails_ai": GUARDRAILS_AVAILABLE}
 
-        # Check for dangerous patterns
-        safety_result = self._check_code_safety(code)
-        violations.extend(safety_result["issues"])
+        # Check 1: Use Guardrails AI code guard if available
+        if self.code_guard is not None and language == "python":
+            try:
+                result = self.code_guard.validate(code)
 
-        # Check imports (Python specific)
-        if language == "python":
-            import_result = self._validate_imports(code)
-            violations.extend(import_result["issues"])
+                if not result.validation_passed:
+                    for fail in result.validation_summaries:
+                        violations.append(f"{fail.validator_name}: {fail.failure_reason}")
+
+                # Check if PII was redacted
+                if result.validated_output != code:
+                    code = result.validated_output
+                    violations.append("pii_redacted_from_code")
+
+            except Exception as e:
+                self.logger.warning(f"Code validation error: {e}")
+
+        # Check 2: Manual dangerous pattern check (always run)
+        for pattern, description in DANGEROUS_CODE_PATTERNS:
+            if re.search(pattern, code, re.IGNORECASE):
+                violations.append(description)
 
         risk_level = RiskLevel.LOW
         if len(violations) >= 3:
@@ -641,47 +576,44 @@ class Guardrails(LoggerMixin):
             risk_level = RiskLevel.MEDIUM
 
         return GuardrailResult(
-            is_valid=len(violations) == 0,
+            is_valid=len(violations) == 0 or risk_level == RiskLevel.LOW,
             action=GuardrailAction.WARN if violations else GuardrailAction.ALLOW,
             risk_level=risk_level,
             message="Code validation complete",
-            modified_content=modified_code if modified_code != code else None,
             violations=violations,
-            metadata={"language": language}
+            metadata=metadata
         )
 
-    def _validate_imports(self, code: str) -> dict[str, Any]:
-        """
-        Validate imports in Python code.
+    # =========================================================================
+    # UTILITY METHODS
+    # =========================================================================
 
-        Args:
-            code: Python code
+    def get_status(self) -> dict[str, Any]:
+        """
+        Get status of guardrails system.
 
         Returns:
-            Import validation result
+            Dict with availability info for each validator
         """
-        issues = []
-
-        # Find all imports
-        import_pattern = r"(?:from\s+(\S+)\s+)?import\s+(\S+)"
-        imports = re.findall(import_pattern, code)
-
-        # Dangerous import modules
-        dangerous_modules = ["ctypes", "cffi", "win32api", "win32con"]
-
-        for from_module, import_name in imports:
-            module = from_module or import_name.split(".")[0]
-            if module in dangerous_modules:
-                issues.append(f"Potentially dangerous import: {module}")
-
-        return {"issues": issues}
+        return {
+            "guardrails_ai_installed": GUARDRAILS_AVAILABLE,
+            "validators": self._validators_status,
+            "input_guard_active": self.input_guard is not None,
+            "output_guard_active": self.output_guard is not None,
+            "code_guard_active": self.code_guard is not None,
+            "config": {
+                "enable_pii_filter": self.config.enable_pii_filter,
+                "enable_toxicity_check": self.config.enable_toxicity_check,
+                "enable_injection_check": self.config.enable_injection_check,
+                "enable_code_validation": self.config.enable_code_validation,
+            }
+        }
 
 
 # ============================================================================
 # CONVENIENCE FUNCTIONS
 # ============================================================================
 
-# Default guardrails instance
 _default_guardrails: Guardrails | None = None
 
 
@@ -702,27 +634,10 @@ def get_guardrails(config: GuardrailConfig | None = None) -> Guardrails:
 
 
 def validate_prompt(text: str) -> GuardrailResult:
-    """
-    Quick validation of a prompt.
-
-    Args:
-        text: Prompt text
-
-    Returns:
-        Validation result
-    """
+    """Quick validation of a prompt."""
     return get_guardrails().validate_input(text)
 
 
 def validate_response(text: str, output_type: str = "text") -> GuardrailResult:
-    """
-    Quick validation of a response.
-
-    Args:
-        text: Response text
-        output_type: Type of output
-
-    Returns:
-        Validation result
-    """
+    """Quick validation of a response."""
     return get_guardrails().validate_output(text, output_type)
