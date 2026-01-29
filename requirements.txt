@@ -1,0 +1,62 @@
+# =============================================================================
+# CODE INTEL BACKEND - REQUIREMENTS
+# =============================================================================
+# This file lists all Python dependencies for the Code Intelligence Backend.
+# Install with: pip install -r requirements.txt
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# WEB FRAMEWORK
+# -----------------------------------------------------------------------------
+fastapi>=0.109.0          # Modern async web framework for building APIs
+uvicorn[standard]>=0.27.0 # ASGI server to run FastAPI
+pydantic>=2.5.0           # Data validation using Python type hints
+pydantic-settings>=2.1.0  # Settings management with Pydantic
+python-multipart>=0.0.6   # File upload support for FastAPI
+
+# -----------------------------------------------------------------------------
+# LANGCHAIN & LLM
+# -----------------------------------------------------------------------------
+langchain>=0.1.0          # Framework for building LLM applications
+langchain-openai>=0.0.5   # OpenAI integration for LangChain
+langchain-community>=0.0.20 # Community integrations for LangChain
+tiktoken>=0.5.2           # Token counting for OpenAI models
+
+# -----------------------------------------------------------------------------
+# VECTOR DATABASE
+# -----------------------------------------------------------------------------
+chromadb>=0.4.22          # Open-source vector database for embeddings
+
+# -----------------------------------------------------------------------------
+# KNOWLEDGE GRAPH
+# -----------------------------------------------------------------------------
+neo4j>=5.15.0             # Neo4j Python driver for graph database
+
+# -----------------------------------------------------------------------------
+# CONVERSATION STORAGE
+# -----------------------------------------------------------------------------
+azure-cosmos>=4.5.1       # Azure Cosmos DB SDK for conversation persistence
+
+# -----------------------------------------------------------------------------
+# GIT & CODE ANALYSIS
+# -----------------------------------------------------------------------------
+gitpython>=3.1.41         # Git repository operations
+
+# -----------------------------------------------------------------------------
+# UTILITIES
+# -----------------------------------------------------------------------------
+httpx>=0.26.0             # Async HTTP client
+aiofiles>=23.2.1          # Async file operations
+structlog>=24.1.0         # Structured logging
+tenacity>=8.2.3           # Retry logic with exponential backoff
+
+# -----------------------------------------------------------------------------
+# DEVELOPMENT DEPENDENCIES
+# -----------------------------------------------------------------------------
+pytest>=7.4.4             # Testing framework
+pytest-asyncio>=0.23.3    # Async testing support
+pytest-cov>=4.1.0         # Coverage reporting
+black>=24.1.0             # Code formatting
+ruff>=0.1.14              # Fast Python linter
+mypy>=1.8.0               # Static type checking
+pre-commit>=3.6.0         # Git hooks for code quality
